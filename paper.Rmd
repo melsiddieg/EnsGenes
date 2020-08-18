@@ -1,0 +1,120 @@
+---
+title: "Ensembl Genes Analysis"
+author: "Mohammed OE Abdallah"
+date: "18/08/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(tidyverse)
+library(janitor)
+library(UpSetR)
+library(gprofiler2)
+```
+
+## Read in the data 
+
+Also perform basic column name cleaning
+
+```{r}
+## read in data and clean up column names
+mrt37 <- fread('data/grch37.tsv')
+mrt37 <- janitor::clean_names(mrt37)
+setindexv(mrt37,c("gene_stable_id","gene_name"))
+mrt37 <- clean_names(mrt37)
+mrt38 <- fread('data/grch38.txt.gz')
+mrt38 <- janitor::clean_names(mrt38)
+setindexv(mrt38,c("gene_stable_id","gene_name"))
+sharedgenes <- inner_join(mrt37,mrt38,by='gene_stable_id')
+```
+
+## Find all genes with discrepant annotations
+
+i.e.,find all gees that has different biotype between the two assemblies 
+```{r}
+
+#### find all genes that changed names and biotype between assemblies
+mrtype <- sharedgenes %>%filter(gene_type.y=='protein_coding'&gene_type.x!='protein_coding') %>% 
+  group_by(gene_stable_id) %>% 
+  summarise(number=n())
+## locate genes that changes between assembly
+idx2 <- match(mrtype$gene_stable_id,sharedgenes$gene_stable_id)
+## final set of genes
+ChangedGenes <- sharedgenes[idx2,]
+setDT(ChangedGenes)
+```
+
+
+## basic stats
+
+```{r}
+### genes that changed names
+ChangedGenes[gene_name.x!=gene_name.y,.N]
+### how many phenotypes in the grch37 subset
+ChangedGenes[nchar(phenotype_description.x)>1,.N]
+### how many phenotypes in the grch38 subset
+ChangedGenes[nchar(phenotype_description.y)>1,.N]
+```
+
+## Get RefSeq mapping from gProfiler  
+
+```{r}
+ref <- gconvert(query = unique(ChangedGenes$gene_stable_id), organism = "hsapiens", target="REFSEQ_MRNA")
+names(ref)[c(2,4)] <- c("gene_stable_id","converted_alias")
+names(ref)
+setDT(ref)
+```
+## Prepare to join with Shared Genes
+
+```{r, warning=FALSE, message=FALSE}
+ref2 <- ref %>% group_nest(gene_stable_id)
+pluckRefSeq <- function(data){
+  if(data$converted_alias=="None"){
+    NA
+  }else{
+    res = data$converted_alias[[1]]
+    res
+  }
+}
+
+ref2$refseq <- ref2$data %>% map_chr(pluckRefSeq)
+setDT(ref2)
+ref2[,data:=NULL]
+```
+
+## Join RefSeq and Ensembl and Prep Final Dataset
+
+```{r}
+ft <- ChangedGenes %>% left_join(ref2)
+setDT(ft)
+ft[,`:=`(inRefSeq=!is.na("refseq"),havePhenotype=nchar(phenotype_description.y)>1, inClinGen=nchar(source_name.y)>1)]
+ft[gene_name.x!=gene_name.y,haveNewHGNC:=TRUE]
+ft[,haveNewBiotype:=TRUE]
+final <- ft %>% select(gene_stable_id,gene_type.x,starts_with("have"), starts_with("in"))
+names(final)[2] <- "Grch37BioType"
+final2 <- final %>% mutate_if(is_logical, as.numeric)
+final3 <- final2 %>% mutate_all(~replace(., is.na(.), 0))
+```
+
+## Visualize
+
+```{r}
+upset(final3,sets = c("havePhenotype","haveNewHGNC","haveNewBiotype","inRefSeq","inClinGen"), order.by =  "freq")
+# save figure
+pdf("Results/Upset.pdf")
+upset(final3,sets = c("havePhenotype","haveNewHGNC","haveNewBiotype","inRefSeq","inClinGen"), order.by =  "freq")
+dev.off()
+```
+
+## Final Phenotype Table
+
+```{r}
+###
+pheno <- ft[nchar(phenotype_description.y)>1,]
+phenoTable <- pheno %>% select(gene_stable_id,gene_name.x,gene_name.y, phenotype_description.x,phenotype_description.y, refseq)
+fwrite(phenoTable,"Results/phenotypes.tsv", sep = "\t")
+
+```
+
